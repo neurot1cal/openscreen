@@ -5,6 +5,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { fixParsedWebmDuration } from "@fix-webm-duration/fix";
+import { WebmFile } from "@fix-webm-duration/parser";
 import type { DesktopCapturerSource } from "electron";
 import {
 	app,
@@ -1217,6 +1219,43 @@ async function loadRecordedSessionForVideoPath(
 	}
 }
 
+/**
+ * Patch the WebM Duration header on a finalized recording file.
+ *
+ * Browser MediaRecorder writes WebM with no Duration EBML element. With the
+ * streaming-to-disk path, the renderer never holds the blob, so the historical
+ * `fixWebmDuration(blob, durationMs)` call can't run. Patching on disk after
+ * `WriteStream.end()` produces an equivalent result: the editor's seek bar and
+ * timeline read a real duration instead of `N/A`.
+ *
+ * Best-effort by design — the file is still playable without the patch (decoders
+ * walk frames sequentially), so a failure here logs and returns rather than
+ * surfacing as an error to the user. Reads the whole file into a Buffer in the
+ * main process; that's the same memory profile as the pre-PR renderer path,
+ * just on the side that doesn't have V8's heap cap.
+ */
+async function patchWebmDurationOnDisk(filePath: string, durationMs: number): Promise<void> {
+	try {
+		const fileBytes = await fs.readFile(filePath);
+		const webm = new WebmFile(new Uint8Array(fileBytes));
+		const patched = fixParsedWebmDuration(webm, durationMs, { logger: false });
+		if (!patched) {
+			// Either no Segment/Info section, or the Duration field was already valid.
+			// Both cases are fine — log at debug level and move on.
+			console.debug(`[patchWebmDurationOnDisk] no patch applied to ${filePath}`);
+			return;
+		}
+		if (!webm.source) {
+			console.error(`[patchWebmDurationOnDisk] patched but source missing for ${filePath}`);
+			return;
+		}
+		const patchedBytes = Buffer.from(webm.source.buffer, webm.source.byteOffset, webm.source.byteLength);
+		await fs.writeFile(filePath, patchedBytes);
+	} catch (error) {
+		console.error(`[patchWebmDurationOnDisk] failed to patch ${filePath}:`, error);
+	}
+}
+
 export function registerIpcHandlers(
 	createEditorWindow: () => void,
 	createSourceSelectorWindow: () => BrowserWindow,
@@ -2131,16 +2170,19 @@ export function registerIpcHandlers(
 		// Close the streaming write stream if one was used; otherwise fall back to
 		// writing the full buffer (short recordings that never opened a stream).
 		const screenWs = activeWriteStreams.get(createdAt);
+		let screenStreamed = false;
 		if (screenWs) {
 			await new Promise<void>((resolve, reject) =>
 				screenWs.end((err?: Error | null) => (err ? reject(err) : resolve())),
 			);
 			activeWriteStreams.delete(createdAt);
+			screenStreamed = true;
 		} else if (payload.screen.videoData && payload.screen.videoData.byteLength > 0) {
 			await fs.writeFile(screenVideoPath, Buffer.from(payload.screen.videoData));
 		}
 
 		let webcamVideoPath: string | undefined;
+		let webcamStreamed = false;
 		if (payload.webcam) {
 			webcamVideoPath = resolveRecordingOutputPath(payload.webcam.fileName);
 			const webcamWs = activeWriteStreams.get(createdAt + 1); // webcam stream keyed as recordingId+1
@@ -2149,9 +2191,31 @@ export function registerIpcHandlers(
 					webcamWs.end((err?: Error | null) => (err ? reject(err) : resolve())),
 				);
 				activeWriteStreams.delete(createdAt + 1);
+				webcamStreamed = true;
 			} else if (payload.webcam.videoData && payload.webcam.videoData.byteLength > 0) {
 				await fs.writeFile(webcamVideoPath, Buffer.from(payload.webcam.videoData));
 			}
+		}
+
+		// Streamed files lack the WebM Duration header (renderer no longer holds the
+		// blob to patch). Patch on disk so the editor's seek bar and timeline work.
+		// Best-effort: log on failure but don't block, since the file is still playable.
+		if (
+			screenStreamed &&
+			typeof payload.durationMs === "number" &&
+			Number.isFinite(payload.durationMs) &&
+			payload.durationMs > 0
+		) {
+			await patchWebmDurationOnDisk(screenVideoPath, payload.durationMs);
+		}
+		if (
+			webcamStreamed &&
+			webcamVideoPath &&
+			typeof payload.durationMs === "number" &&
+			Number.isFinite(payload.durationMs) &&
+			payload.durationMs > 0
+		) {
+			await patchWebmDurationOnDisk(webcamVideoPath, payload.durationMs);
 		}
 
 		const session: RecordingSession = webcamVideoPath

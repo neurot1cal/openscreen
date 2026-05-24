@@ -454,6 +454,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 								: undefined,
 						createdAt: activeRecordingId,
 						cursorCaptureMode,
+						durationMs: duration,
 					});
 
 					if (!result.success) {
